@@ -10,6 +10,7 @@ client = ModbusClient(
     port=PORT,
     baudrate=BAUDRATE,
     parity='N',
+    
     stopbits=1,
     bytesize=8,
     timeout=3

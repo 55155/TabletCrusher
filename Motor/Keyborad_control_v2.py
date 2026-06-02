@@ -18,11 +18,24 @@ class MotorController:
             stopbits=1,
             timeout=timeout,
         )
+        
         self.device_id = device_id
         self.lock = threading.Lock()
 
     def connect(self):
-        return self.client.connect()
+        if not self.client.connect():
+            return False
+        time.sleep(0.5)  # 모터 안정화
+        
+        # Remote Mode 강제 설정 (PDF 기준)
+        self.set_enable(0)      # 안전 정지
+        self.set_cw_ccw(0)      # CW
+        self.set_speed(100)     # 테스트 속도
+        self.set_enable(1)      # 시작!
+        
+        test_rpm = self.read_register(0x0015, 1)
+        print(f"RPM: {test_rpm}")  # 값 출력되면 성공!
+        return test_rpm is not None
 
     def close(self):
         self.set_speed(0)
