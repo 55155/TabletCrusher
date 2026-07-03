@@ -9,6 +9,8 @@ from matplotlib.animation import FuncAnimation
 # Matplotlib 백엔드 설정
 matplotlib.use('TkAgg')
 class MotorController:
+
+
     def __init__(self, port="/dev/ttyUSB0", baudrate=115200, device_id=100, timeout = 0.1):
         self.client = ModbusSerialClient(
             port=port,
