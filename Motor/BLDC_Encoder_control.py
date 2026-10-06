@@ -42,6 +42,27 @@ PC + USB-RS485 컨버터로 누리로봇 MC-RS485 프로토콜을 쓴다.
 7. 속도제어로 회전 중 위치 지령을 보내면 **정지 과정 없이 전환**된다.
    크랭크 전진(속도제어) / 후퇴(위치제어) 알고리즘이 성립한다.
 
+8. **원점(홈) 복귀는 PC가 추적한 누적 변위를 되돌리는 방식이다.** 드라이버에
+   원점 저장 레지스터가 없으므로(위 5), 프로그램을 시작한 바로 이 위치를
+   "홈"으로 보고 move() 가 feedback() 의 실측 방향(좌표 증감이 아니라
+   CW/CCW 바이트)으로 누적 변위를 갱신한다. 프로그램이 정상 종료·예외·
+   Ctrl+C 중 무엇으로 끝나도 close()(with 블록의 __exit__)가 누적 변위를
+   역방향으로 상쇄해 홈으로 복귀한 뒤 제어를 끈다.
+
+9. **위치제어(move)·속도제어(run) 를 한 프로세스 안에서 섞어 써도 추적된다.**
+   run() 중에는 poll_speed() 를 주기적으로 불러 RPM×경과시간을 적분하고,
+   stop_run() 또는 뒤이은 move() 호출 시점에 그 구간이 _home_offset 에
+   합산된다(position 필드가 아니라 RPM 적분을 쓰는 이유는 아래 10번). 이
+   추적은 프로세스(= 객체) 생명주기 안에서만 유효하다 — CLI 의
+   speed/stop 처럼 서로 다른 프로세스 실행으로 나누면 추적이 끊긴다
+   (디바이스에도 저장 수단이 없음, 위 5).
+
+10. **run() 중 position 필드는 믿지 말 것(실측 확인).** 연속 회전 중에는
+   0xD1 의 위치 필드가 간헐적으로 수십 도씩 튀는 값을 보여줄 때가 있다
+   (0.1초 간격 polling 중 52도→2.5도로 점프하는 사례 실측). move() 로
+   정지 상태에서 읽는 position(위 1, 6)은 이 문제가 없다. 그래서 위 9의
+   회전량 추적은 RPM 적분을 쓴다.
+
 --------------------------------------------------------------------------
 미확정 — 실사용 전 확인할 것
 --------------------------------------------------------------------------
@@ -65,6 +86,10 @@ PC + USB-RS485 컨버터로 누리로봇 MC-RS485 프로토콜을 쓴다.
   python BLDC_Encoder_control.py --port COM5 speed 300   30.0RPM 회전
   python BLDC_Encoder_control.py --port COM5 stop
   python BLDC_Encoder_control.py --port COM5 watch 5     5초간 피드백 출력
+
+  프로그램이 어떤 식으로 끝나든(정상/예외/Ctrl+C) 종료 직전에 시작 위치
+  ("홈")로 자동 복귀한 뒤 제어를 끈다. 홈 기준은 이 프로그램을 시작한
+  시점의 위치이며, 전원을 끄지 않는 한 그 위치가 계속 홈으로 유지된다.
 """
 
 import argparse
@@ -126,6 +151,16 @@ class BLC400R4E:
         self.verbose = verbose
         self.ser = serial.Serial(port, baud, bytesize=8, parity="N",
                                  stopbits=1, timeout=timeout)
+        self._home_offset = 0.0   # 홈(시작 위치) 기준 누적 변위 [deg]. CW(+)/CCW(-)
+        self._speed_last_t = None # 속도제어 추적 중 마지막 poll 시각(monotonic). None=추적 안 함
+        self._speed_last_rpm = 0.0 # 같은 추적의 마지막 RPM 샘플(사다리꼴 적분용)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
     # -- 프레임 ------------------------------------------------------------
     def frame(self, mode, data=b""):
@@ -248,7 +283,14 @@ class BLC400R4E:
 
         위치 지령 순간 드라이버가 좌표를 0 으로 리셋하므로, 여기 넣는 값이
         그대로 이동량이 된다. 현재 위치를 더하지 않는다.
+
+        직전에 run() 으로 속도제어 중이었다면(§7: 정지 과정 없이 전환),
+        명령을 보내기 전에 그 구간 회전량을 먼저 _home_offset 에 반영한다
+        — stop_run() 을 안 불러도 전환 시점에 자동으로 마무리된다.
         """
+        if self._speed_last_t is not None:
+            self.poll_speed()
+            self._speed_last_t = None
         if not 0 < degrees <= POS_MAX_DEG:
             raise ValueError(f"이동량은 0 초과 {POS_MAX_DEG}도 이하여야 합니다")
         t01 = max(1, min(255, int(round(reach_s * 10))))
@@ -257,32 +299,128 @@ class BLC400R4E:
                      settle=0.02)
 
     def run(self, rpm_x10, direction=CW, reach_s=1.0):
-        """속도제어로 연속 회전. 정지는 disable() 로 한다."""
+        """속도제어로 연속 회전 시작.
+
+        정지는 disable() 이 아니라 stop_run() 으로 할 것 — disable() 은
+        회전량을 _home_offset 에 반영하지 않고 바로 끈다. 회전 중 주기적으로
+        poll_speed() 를 불러줘야 추적이 된다(아래 참고).
+
+        추적 시작 시각은 명령 전송 *뒤*에 찍는다 — 전송 전에 찍으면
+        _send() 의 응답 대기(최대 0.4초, 이 명령은 응답이 없어 항상 다
+        채운다)까지 "이미 회전 중"으로 적분해 과대 추정하게 된다(실측
+        확인: 1.4초짜리 회전을 ~66도로, 실제 ~52도보다 크게 잘못 계산).
+        """
         t01 = max(1, min(255, int(round(reach_s * 10))))
         self.command(M_SPEED,
                      bytes([direction]) + _u16(int(rpm_x10)) + bytes([t01]),
                      settle=0.02)
+        self._speed_last_t = time.monotonic()
+        self._speed_last_rpm = 0.0   # 정지 상태에서 시작한다고 가정(사다리꼴 적분용)
 
-    def wait_stop(self, timeout=10.0, poll=0.04):
-        """이동이 끝날 때까지 기다린다. 도달 위치를 돌려준다."""
+    def poll_speed(self):
+        """속도제어(run()) 중 회전량을 누적한다.
+
+        position 필드가 아니라 RPM×경과시간 적분(사다리꼴: 이전·현재 RPM
+        평균)을 쓴다 — 실측해보니 연속 회전 중 position 필드가 간헐적으로
+        튀는 값을 보여(수십 도가 한 틱 사이 점프), 그대로 적분하면 틀린
+        값이 쌓인다. RPM은 같은 구간에서 안정적이었고, position 필드가
+        멈춰서(move()) 보여주는 값과도 6×RPM×dt 가 잘 맞는다(실측 확인).
+        run() 을 부르지 않은 상태(추적 비활성)면 아무 것도 안 하고 None.
+        """
+        if self._speed_last_t is None:
+            return None
+        now = time.monotonic()
+        dt = now - self._speed_last_t
+        self._speed_last_t = now
+        fb = self.feedback()
+        if fb is None:
+            return None
+        direction, _, rpm, _ = fb
+        avg_rpm = (self._speed_last_rpm + rpm) / 2.0
+        self._speed_last_rpm = rpm
+        delta = avg_rpm * 6.0 * dt   # RPM -> deg/s
+        self._home_offset += delta if direction == "CW" else -delta
+        return fb
+
+    def stop_run(self):
+        """속도제어 종료: 남은 회전량을 한 번 더 반영한 뒤 제어를 끈다."""
+        self.poll_speed()
+        self._speed_last_t = None
+        self.disable()
+
+    def wait_stop(self, timeout=10.0, poll=0.04, track=True):
+        """이동이 끝날 때까지 기다린다. 도달 위치를 돌려준다.
+
+        track=True 면 정지 후 feedback() 의 실측 방향으로 홈 기준 누적
+        변위(self._home_offset)를 갱신한다. 위치 지령 1회(move())의 결과를
+        반영하는 용도이므로, 연속 속도제어(run()) 뒤에는 track=False 로
+        호출할 것 — 끝나지 않은 회전을 "도달 변위"로 잘못 누적하게 된다.
+
+        추적(finally)은 대기 루프가 어떻게 끝나든(정상 완료 / Ctrl+C) 실행된다
+        — 이동 "중" 끊겨도 그 순간의 실측 위치를 홈 복귀 계산에 반영하기 위함.
+        """
         t0 = time.monotonic()
         moved = False
-        while time.monotonic() - t0 < timeout:
-            fb = self.feedback()
-            if fb:
-                if fb[2] > 0.5:
-                    moved = True
-                elif moved:
-                    break
-            time.sleep(poll)
-        time.sleep(0.4)
+        try:
+            while time.monotonic() - t0 < timeout:
+                fb = self.feedback()
+                if fb:
+                    if fb[2] > 0.5:
+                        moved = True
+                    elif moved:
+                        break
+                time.sleep(poll)
+            time.sleep(0.4)
+        finally:
+            if track:
+                fb = self.feedback()
+                if fb is not None:
+                    direction, deg = fb[0], fb[1]
+                    self._home_offset += deg if direction == "CW" else -deg
+        return self.position()
+
+    def home(self, tolerance_deg=0.15, max_iter=20):
+        """홈(프로그램 시작 위치)으로 복귀. 누적 변위가 없으면 아무 것도 안 한다.
+
+        원점 저장 레지스터가 없으므로(docstring §5) PC가 추적한
+        self._home_offset 을 역방향으로 상쇄하는 방식이다. 지령 상한
+        655.33도(§4)를 넘는 변위는 여러 번에 나눠 이동한다.
+
+        위치 유지 중에도 RPM이 완전히 0으로 안 떨어지는 경우가 있어
+        wait_stop() 의 RPM 임계치 감지를 쓰면 매번 타임아웃을 다 채운다.
+        대신 move() 에 넘긴 도달시간만큼만 고정 대기한다(검증된 90도/1.0초
+        기준과 동일한 비율, §검증된 설정값).
+        """
+        if abs(self._home_offset) <= tolerance_deg:
+            return None
+        if not self.alive():
+            return None
+        for _ in range(max_iter):
+            if abs(self._home_offset) <= tolerance_deg:
+                break
+            step = min(abs(self._home_offset), POS_MAX_DEG - 1.0)
+            direction = CCW if self._home_offset > 0 else CW
+            reach = max(1.0, step / 90.0)
+            self.enable()
+            self.move(step, direction, reach_s=reach)
+            try:
+                time.sleep(reach + 0.4)
+            finally:
+                fb = self.feedback()
+                self.disable()
+                if fb is not None:
+                    fb_dir, deg = fb[0], fb[1]
+                    self._home_offset += deg if fb_dir == "CW" else -deg
         return self.position()
 
     def close(self):
         try:
-            self.disable()
+            self.home()
         finally:
-            self.ser.close()
+            try:
+                self.disable()
+            finally:
+                self.ser.close()
 
 
 # ---- CLI -----------------------------------------------------------------
@@ -298,9 +436,8 @@ def main():
     ap.add_argument("value", nargs="?", type=float)
     a = ap.parse_args()
 
-    m = BLC400R4E(a.port, a.baud, a.id, verbose=a.verbose)
     direction = CCW if a.ccw else CW
-    try:
+    with BLC400R4E(a.port, a.baud, a.id, verbose=a.verbose) as m:
         if not m.alive():
             print("드라이버 무응답 — 24V 전원과 RS-485 결선을 확인하십시오")
             return
@@ -349,8 +486,6 @@ def main():
                     print(f"  t={time.monotonic()-t0:5.2f}s  {fb[0]:3s} "
                           f"{fb[1]:8.2f}deg  {fb[2]:6.1f}RPM  {fb[3]:4.1f}A")
                 time.sleep(0.1)
-    finally:
-        m.ser.close()
 
 
 if __name__ == "__main__":
